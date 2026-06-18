@@ -105,12 +105,12 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         let client_uuid = req.uuid.clone().unwrap_or_default();
                         let client_session_id = req.session_id.clone().unwrap_or_default();
                         
-                        println!("[CONN] Request - User: {}, UUID: '{}', Session: '{}'", user_id, client_uuid, client_session_id);
+                        eprintln!("[CONN] Request - User: {}, UUID: '{}', Session: '{}'", user_id, client_uuid, client_session_id);
 
                         let mut conns = state.active_connections.lock().await;
                         let conns_list = conns.entry(user_id.clone()).or_insert_with(Vec::new);
                         
-                        println!("[CONN] Before check - Active count: {}. Connections: {:?}", 
+                        eprintln!("[CONN] Before check - Active count: {}. Connections: {:?}", 
                             conns_list.len(), 
                             conns_list.iter().map(|c| format!("(session_id: '{}', uuid: '{}')", c.session_id, c.uuid)).collect::<Vec<_>>()
                         );
@@ -120,7 +120,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         if !client_session_id.is_empty() {
                             if let Some(pos) = conns_list.iter().position(|c| c.session_id == client_session_id) {
                                 let old_conn = conns_list.remove(pos);
-                                println!("[CONN] Evicting duplicate session_id: '{}'", client_session_id);
+                                eprintln!("[CONN] Evicting duplicate session_id: '{}'", client_session_id);
                                 let _ = old_conn.disconnect_tx.send(());
                                 evicted = true;
                             }
@@ -129,7 +129,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         if !evicted && client_session_id.is_empty() && !client_uuid.is_empty() {
                             if let Some(pos) = conns_list.iter().position(|c| c.uuid == client_uuid) {
                                 let old_conn = conns_list.remove(pos);
-                                println!("[CONN] Evicting duplicate UUID (fallback): '{}'", client_uuid);
+                                eprintln!("[CONN] Evicting duplicate UUID (fallback): '{}'", client_uuid);
                                 let _ = old_conn.disconnect_tx.send(());
                                 evicted = true;
                             }
@@ -140,14 +140,14 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         if !evicted && conns_list.len() >= max_connections as usize && !client_uuid.is_empty() {
                             if let Some(pos) = conns_list.iter().position(|c| c.uuid == client_uuid) {
                                 let old_conn = conns_list.remove(pos);
-                                println!("[CONN] Evicting duplicate UUID under limit constraint: '{}'", client_uuid);
+                                eprintln!("[CONN] Evicting duplicate UUID under limit constraint: '{}'", client_uuid);
                                 let _ = old_conn.disconnect_tx.send(());
                             }
                         }
 
                         // If limit is exceeded, reject this new connection with LIMIT_EXCEEDED.
                         if conns_list.len() >= max_connections as usize {
-                            println!("[CONN] Rejected! Limit {} exceeded. Active count: {}", max_connections, conns_list.len());
+                            eprintln!("[CONN] Rejected! Limit {} exceeded. Active count: {}", max_connections, conns_list.len());
                             drop(conns);
                             let resp = AuthResponse {
                                 status: "ERROR".to_string(),
@@ -158,7 +158,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             return;
                         }
 
-                        println!("[CONN] Accepted!");
+                        eprintln!("[CONN] Accepted!");
 
                         // Create disconnect channel for this connection
                         let (disconnect_tx, mut disconnect_rx) = tokio::sync::oneshot::channel::<()>();
