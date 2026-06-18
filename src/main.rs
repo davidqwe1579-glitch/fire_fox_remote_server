@@ -121,6 +121,16 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             if let Some(pos) = conns_list.iter().position(|c| c.uuid == client_uuid) {
                                 let old_conn = conns_list.remove(pos);
                                 let _ = old_conn.disconnect_tx.send(());
+                                evicted = true;
+                            }
+                        }
+
+                        // If limit is exceeded, and we have an active connection with the same uuid (but different session_id),
+                        // evict it to let the new session connect.
+                        if !evicted && conns_list.len() >= max_connections as usize && !client_uuid.is_empty() {
+                            if let Some(pos) = conns_list.iter().position(|c| c.uuid == client_uuid) {
+                                let old_conn = conns_list.remove(pos);
+                                let _ = old_conn.disconnect_tx.send(());
                             }
                         }
 
