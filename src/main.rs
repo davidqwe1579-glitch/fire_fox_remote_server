@@ -12,16 +12,27 @@ use serde::{Deserialize, Serialize};
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
+use tokio::sync::oneshot;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+struct ActiveSession {
+    device_id: String,
+    session_id: u64,
+    close_tx: oneshot::Sender<()>,
+}
+
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 struct AppState {
     db: MySqlPool,
-    active_connections: Arc<Mutex<HashMap<String, i32>>>,
+    active_connections: Arc<Mutex<HashMap<String, Vec<ActiveSession>>>>,
 }
 
 #[derive(Deserialize)]
 struct AuthRequest {
     user_id: String,
+    device_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -68,6 +79,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         if let Ok(Message::Text(text)) = msg {
             if let Ok(req) = serde_json::from_str::<AuthRequest>(&text) {
                 let user_id = req.user_id.clone();
+                let device_id = req.device_id.clone().unwrap_or_else(|| "unknown".to_string());
                 
                 // Use UTC comparison. MySQL DATETIME is retrieved as NaiveDateTime
                 let row: Result<(chrono::NaiveDateTime, i32), sqlx::Error> = sqlx::query_as(
@@ -90,27 +102,52 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             return;
                         }
 
+                        let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::SeqCst);
+                        let (close_tx, mut close_rx) = oneshot::channel::<()>();
+
                         let mut conns = state.active_connections.lock().await;
-                        let current_count = conns.get(&user_id).copied().unwrap_or(0);
-                        
-                        if current_count >= max_connections {
-                            let resp = AuthResponse {
-                                status: "ERROR".to_string(),
-                                message: "LIMIT_EXCEEDED".to_string(),
-                            };
-                            let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
-                            let _ = socket.close().await;
-                            return;
+                        let sessions = conns.entry(user_id.clone()).or_default();
+
+                        // 1. Evict any existing session with the same device_id (except "unknown")
+                        if device_id != "unknown" {
+                            if let Some(pos) = sessions.iter().position(|s| s.device_id == device_id) {
+                                let old_session = sessions.remove(pos);
+                                let _ = old_session.close_tx.send(());
+                            }
                         }
 
-                        conns.insert(user_id.clone(), current_count + 1);
+                        // 2. Check if we exceed max_connections
+                        if sessions.len() as i32 >= max_connections {
+                            // Evict the oldest connection
+                            let old_session = sessions.remove(0);
+                            let _ = old_session.close_tx.send(());
+                        }
+
+                        // Add this new session
+                        sessions.push(ActiveSession {
+                            device_id: device_id.clone(),
+                            session_id,
+                            close_tx,
+                        });
                         drop(conns);
-                        
+
                         let resp = AuthResponse {
                             status: "OK".to_string(),
                             message: "LOGGED_IN".to_string(),
                         };
-                        let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
+                        if socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await.is_err() {
+                            // Clean up session if sending response fails
+                            let mut conns = state.active_connections.lock().await;
+                            if let Some(sessions) = conns.get_mut(&user_id) {
+                                if let Some(pos) = sessions.iter().position(|s| s.session_id == session_id) {
+                                    sessions.remove(pos);
+                                }
+                                if sessions.is_empty() {
+                                    conns.remove(&user_id);
+                                }
+                            }
+                            return;
+                        }
 
                         let (mut sender, mut receiver) = socket.split();
                         let user_id_clone = user_id.clone();
@@ -121,6 +158,13 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             _ = async {
                                 loop {
                                     check_interval.tick().await;
+                                    
+                                    // Send heartbeat to check if socket is still alive
+                                    let heartbeat = serde_json::json!({ "status": "PING" });
+                                    if sender.send(Message::Text(heartbeat.to_string().into())).await.is_err() {
+                                        break;
+                                    }
+
                                     let row: Result<(chrono::NaiveDateTime,), sqlx::Error> = sqlx::query_as(
                                         "SELECT expire_date FROM user WHERE user_id = ?"
                                     )
@@ -160,22 +204,40 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                         break;
                                     }
                                 }
-                            } => {}
+                            } => {},
+                            _ = &mut close_rx => {
+                                let resp = AuthResponse {
+                                    status: "ERROR".to_string(),
+                                    message: "LIMIT_EXCEEDED".to_string(),
+                                };
+                                let _ = sender.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
+                            }
                         }
 
                         // Decrement connection limit on disconnect
                         let mut conns = state.active_connections.lock().await;
-                        if let Some(c) = conns.get_mut(&user_id) {
-                            *c -= 1;
-                            if *c <= 0 {
+                        if let Some(sessions) = conns.get_mut(&user_id) {
+                            if let Some(pos) = sessions.iter().position(|s| s.session_id == session_id) {
+                                sessions.remove(pos);
+                            }
+                            if sessions.is_empty() {
                                 conns.remove(&user_id);
                             }
                         }
                     }
-                    Err(_) => {
+                    Err(sqlx::Error::RowNotFound) => {
                         let resp = AuthResponse {
                             status: "ERROR".to_string(),
                             message: "INVALID_USER".to_string(),
+                        };
+                        let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
+                        let _ = socket.close().await;
+                    }
+                    Err(e) => {
+                        eprintln!("Initial auth database query error: {}", e);
+                        let resp = AuthResponse {
+                            status: "ERROR".to_string(),
+                            message: "SERVER_ERROR".to_string(),
                         };
                         let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
                         let _ = socket.close().await;
