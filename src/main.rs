@@ -32,7 +32,7 @@ struct AuthResponse {
 
 #[tokio::main]
 async fn main() {
-    let database_url = "mysql://usesr_account:Aa102331253910!@localhost/Fire_fox_remote_server";
+    let database_url = "mysql://user_account:Aa102331253910!@localhost/Fire_fox_remote_server";
     let pool = match MySqlPoolOptions::new()
         .max_connections(5)
         .connect(database_url)
