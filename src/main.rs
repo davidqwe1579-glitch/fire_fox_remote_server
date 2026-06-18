@@ -17,6 +17,10 @@ struct ConnectionInfo {
     id: u64,
     uuid: String,
     session_id: String,
+    username: String,
+    hostname: String,
+    platform: String,
+    broadcast_tx: tokio::sync::mpsc::UnboundedSender<Message>,
     disconnect_tx: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -33,6 +37,9 @@ struct AuthRequest {
     user_id: String,
     uuid: Option<String>,
     session_id: Option<String>,
+    username: Option<String>,
+    hostname: Option<String>,
+    platform: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -160,16 +167,42 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
 
                         eprintln!("[CONN] Accepted!");
 
-                        // Create disconnect channel for this connection
+                        // Create channels for this connection
                         let (disconnect_tx, mut disconnect_rx) = tokio::sync::oneshot::channel::<()>();
+                        let (broadcast_tx, mut broadcast_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+                        
+                        let client_username = req.username.clone().unwrap_or_default();
+                        let client_hostname = req.hostname.clone().unwrap_or_default();
+                        let client_platform = req.platform.clone().unwrap_or_default();
+
                         conns_list.push(ConnectionInfo {
                             id: conn_id,
                             uuid: client_uuid,
                             session_id: client_session_id,
+                            username: client_username,
+                            hostname: client_hostname,
+                            platform: client_platform,
+                            broadcast_tx,
                             disconnect_tx,
                         });
+                        
                         let current_count = conns_list.len() as i32;
                         let db_count = current_count - 1;
+                        
+                        // Broadcast updated peers list to all clients of this user
+                        let peers_payload = serde_json::json!({
+                            "status": "PEERS_UPDATE",
+                            "peers": conns_list.iter().map(|c| serde_json::json!({
+                                "id": c.uuid.clone(),
+                                "username": c.username.clone(),
+                                "hostname": c.hostname.clone(),
+                                "platform": c.platform.clone(),
+                            })).collect::<Vec<_>>()
+                        }).to_string();
+                        for c in conns_list.iter() {
+                            let _ = c.broadcast_tx.send(Message::Text(peers_payload.clone().into()));
+                        }
+
                         drop(conns);
 
                         // Update DB with the current active connection count
@@ -186,18 +219,35 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
 
                         let (mut sender, mut receiver) = socket.split();
+                        let (tx_out, mut rx_out) = tokio::sync::mpsc::unbounded_channel::<Message>();
+                        let tx_out_clone1 = tx_out.clone();
+                        let tx_out_clone2 = tx_out.clone();
+                        let tx_out_clone3 = tx_out.clone();
+                        
                         let user_id_clone = user_id.clone();
                         let state_clone = state.clone();
                         let mut check_interval = tokio::time::interval(Duration::from_secs(10));
                         
                         tokio::select! {
-                            _ = &mut disconnect_rx => {
-                                let resp = AuthResponse {
-                                    status: "ERROR".to_string(),
-                                    message: "EVICTED".to_string(),
-                                };
-                                let _ = sender.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
-                            }
+                            _ = async {
+                                while let Some(msg) = rx_out.recv().await {
+                                    let _ = sender.send(msg).await;
+                                }
+                            } => {}
+                            _ = async {
+                                while let Some(msg) = broadcast_rx.recv().await {
+                                    let _ = tx_out_clone1.send(msg);
+                                }
+                            } => {}
+                            _ = async {
+                                if let Ok(_) = disconnect_rx.await {
+                                    let resp = AuthResponse {
+                                        status: "ERROR".to_string(),
+                                        message: "EVICTED".to_string(),
+                                    };
+                                    let _ = tx_out_clone2.send(Message::Text(serde_json::to_string(&resp).unwrap().into()));
+                                }
+                            } => {}
                             _ = async {
                                 loop {
                                     check_interval.tick().await;
@@ -216,7 +266,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                                     status: "ERROR".to_string(),
                                                     message: "EXPIRED".to_string(),
                                                 };
-                                                let _ = sender.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
+                                                let _ = tx_out_clone3.send(Message::Text(serde_json::to_string(&resp).unwrap().into()));
                                                 break;
                                             }
                                         }
@@ -241,6 +291,23 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         if let Some(conns_list) = conns.get_mut(&user_id) {
                             conns_list.retain(|c| c.id != conn_id);
                             current_count = conns_list.len() as i32;
+                            
+                            // Broadcast updated peers list to remaining clients
+                            if !conns_list.is_empty() {
+                                let peers_payload = serde_json::json!({
+                                    "status": "PEERS_UPDATE",
+                                    "peers": conns_list.iter().map(|c| serde_json::json!({
+                                        "id": c.uuid.clone(),
+                                        "username": c.username.clone(),
+                                        "hostname": c.hostname.clone(),
+                                        "platform": c.platform.clone(),
+                                    })).collect::<Vec<_>>()
+                                }).to_string();
+                                for c in conns_list.iter() {
+                                    let _ = c.broadcast_tx.send(Message::Text(peers_payload.clone().into()));
+                                }
+                            }
+
                             if conns_list.is_empty() {
                                 conns.remove(&user_id);
                             }
