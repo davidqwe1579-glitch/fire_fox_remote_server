@@ -15,6 +15,8 @@ use tokio::sync::Mutex;
 
 struct ConnectionInfo {
     id: u64,
+    uuid: String,
+    session_id: String,
     disconnect_tx: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -29,6 +31,8 @@ static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 #[derive(Deserialize)]
 struct AuthRequest {
     user_id: String,
+    uuid: Option<String>,
+    session_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -41,7 +45,7 @@ struct AuthResponse {
 async fn main() {
     let database_url = "mysql://user_account:Aa102331253910!@localhost/Fire_fox_remote_server";
     let pool = match MySqlPoolOptions::new()
-        .max_connections(5)
+        .max_connections(50)
         .connect(database_url)
         .await
     {
@@ -98,28 +102,55 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             return;
                         }
 
+                        let client_uuid = req.uuid.clone().unwrap_or_default();
+                        let client_session_id = req.session_id.clone().unwrap_or_default();
                         let mut conns = state.active_connections.lock().await;
                         let conns_list = conns.entry(user_id.clone()).or_insert_with(Vec::new);
                         
-                        // If limit is exceeded, kick the oldest connection(s)
-                        while conns_list.len() >= max_connections as usize {
-                            if let Some(old_conn) = conns_list.drain(0..1).next() {
+                        // Always evict duplicate session_id first (reconnections of the same running process)
+                        let mut evicted = false;
+                        if !client_session_id.is_empty() {
+                            if let Some(pos) = conns_list.iter().position(|c| c.session_id == client_session_id) {
+                                let old_conn = conns_list.remove(pos);
+                                let _ = old_conn.disconnect_tx.send(());
+                                evicted = true;
+                            }
+                        }
+                        // Fallback to uuid eviction if session_id was not provided
+                        if !evicted && client_session_id.is_empty() && !client_uuid.is_empty() {
+                            if let Some(pos) = conns_list.iter().position(|c| c.uuid == client_uuid) {
+                                let old_conn = conns_list.remove(pos);
                                 let _ = old_conn.disconnect_tx.send(());
                             }
+                        }
+
+                        // If limit is exceeded, reject this new connection with LIMIT_EXCEEDED.
+                        if conns_list.len() >= max_connections as usize {
+                            drop(conns);
+                            let resp = AuthResponse {
+                                status: "ERROR".to_string(),
+                                message: "LIMIT_EXCEEDED".to_string(),
+                            };
+                            let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
+                            let _ = socket.close().await;
+                            return;
                         }
 
                         // Create disconnect channel for this connection
                         let (disconnect_tx, mut disconnect_rx) = tokio::sync::oneshot::channel::<()>();
                         conns_list.push(ConnectionInfo {
                             id: conn_id,
+                            uuid: client_uuid,
+                            session_id: client_session_id,
                             disconnect_tx,
                         });
                         let current_count = conns_list.len() as i32;
+                        let db_count = current_count - 1;
                         drop(conns);
 
                         // Update DB with the current active connection count
                         let _ = sqlx::query("UPDATE user SET current_connections = ? WHERE user_id = ?")
-                            .bind(current_count)
+                            .bind(db_count)
                             .bind(&user_id)
                             .execute(&state.db)
                             .await;
@@ -133,13 +164,13 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         let (mut sender, mut receiver) = socket.split();
                         let user_id_clone = user_id.clone();
                         let state_clone = state.clone();
-                        let mut check_interval = tokio::time::interval(Duration::from_secs(1));
+                        let mut check_interval = tokio::time::interval(Duration::from_secs(10));
                         
                         tokio::select! {
                             _ = &mut disconnect_rx => {
                                 let resp = AuthResponse {
                                     status: "ERROR".to_string(),
-                                    message: "LIMIT_EXCEEDED".to_string(),
+                                    message: "EVICTED".to_string(),
                                 };
                                 let _ = sender.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
                             }
@@ -153,18 +184,21 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                     .fetch_one(&state_clone.db)
                                     .await;
 
-                                    if let Ok((expire_date,)) = row {
-                                        let now = chrono::Utc::now().naive_utc();
-                                        if now > expire_date {
-                                            let resp = AuthResponse {
-                                                status: "ERROR".to_string(),
-                                                message: "EXPIRED".to_string(),
-                                            };
-                                            let _ = sender.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
-                                            break;
+                                    match row {
+                                        Ok((expire_date,)) => {
+                                            let now = chrono::Utc::now().naive_utc();
+                                            if now > expire_date {
+                                                let resp = AuthResponse {
+                                                    status: "ERROR".to_string(),
+                                                    message: "EXPIRED".to_string(),
+                                                };
+                                                let _ = sender.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
+                                                break;
+                                            }
                                         }
-                                    } else {
-                                        break; 
+                                        Err(e) => {
+                                            eprintln!("Database error in expiration check for user {}: {:?}", user_id_clone, e);
+                                        }
                                     }
                                 }
                             } => {},
@@ -187,11 +221,12 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                 conns.remove(&user_id);
                             }
                         }
+                        let db_count = current_count - 1;
                         drop(conns);
 
                         // Update DB with the new count
                         let _ = sqlx::query("UPDATE user SET current_connections = ? WHERE user_id = ?")
-                            .bind(current_count)
+                            .bind(db_count)
                             .bind(&user_id)
                             .execute(&state.db)
                             .await;
