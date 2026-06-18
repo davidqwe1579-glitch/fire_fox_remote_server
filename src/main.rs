@@ -13,20 +13,18 @@ use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
-
-struct ActiveConnection {
+struct ConnectionInfo {
     id: u64,
-    kick_tx: tokio::sync::oneshot::Sender<()>,
+    disconnect_tx: tokio::sync::oneshot::Sender<()>,
 }
 
 #[derive(Clone)]
 struct AppState {
     db: MySqlPool,
-    active_connections: Arc<Mutex<HashMap<String, Vec<ActiveConnection>>>>,
+    active_connections: Arc<Mutex<HashMap<String, Vec<ConnectionInfo>>>>,
 }
+
+static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[derive(Deserialize)]
 struct AuthRequest {
@@ -73,6 +71,7 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 }
 
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
+    let conn_id = NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     if let Some(msg) = socket.recv().await {
         if let Ok(Message::Text(text)) = msg {
             if let Ok(req) = serde_json::from_str::<AuthRequest>(&text) {
@@ -100,19 +99,20 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         }
 
                         let mut conns = state.active_connections.lock().await;
-                        let list = conns.entry(user_id.clone()).or_default();
+                        let conns_list = conns.entry(user_id.clone()).or_insert_with(Vec::new);
                         
                         // If limit is exceeded, kick the oldest connection(s)
-                        while list.len() >= max_connections as usize && !list.is_empty() {
-                            let oldest = list.remove(0);
-                            let _ = oldest.kick_tx.send(());
+                        while conns_list.len() >= max_connections as usize {
+                            if let Some(old_conn) = conns_list.drain(0..1).next() {
+                                let _ = old_conn.disconnect_tx.send(());
+                            }
                         }
 
-                        let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
-                        let (kick_tx, mut kick_rx) = tokio::sync::oneshot::channel();
-                        list.push(ActiveConnection {
+                        // Create disconnect channel for this connection
+                        let (disconnect_tx, mut disconnect_rx) = tokio::sync::oneshot::channel::<()>();
+                        conns_list.push(ConnectionInfo {
                             id: conn_id,
-                            kick_tx,
+                            disconnect_tx,
                         });
                         drop(conns);
                         
@@ -120,17 +120,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             status: "OK".to_string(),
                             message: "LOGGED_IN".to_string(),
                         };
-                        if socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await.is_err() {
-                            // Clean up connection immediately if send failed
-                            let mut conns = state.active_connections.lock().await;
-                            if let Some(list) = conns.get_mut(&user_id) {
-                                list.retain(|c| c.id != conn_id);
-                                if list.is_empty() {
-                                    conns.remove(&user_id);
-                                }
-                            }
-                            return;
-                        }
+                        let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
 
                         let (mut sender, mut receiver) = socket.split();
                         let user_id_clone = user_id.clone();
@@ -138,6 +128,13 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         let mut check_interval = tokio::time::interval(Duration::from_secs(1));
                         
                         tokio::select! {
+                            _ = &mut disconnect_rx => {
+                                let resp = AuthResponse {
+                                    status: "ERROR".to_string(),
+                                    message: "LIMIT_EXCEEDED".to_string(),
+                                };
+                                let _ = sender.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
+                            }
                             _ = async {
                                 loop {
                                     check_interval.tick().await;
@@ -169,21 +166,14 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                         break;
                                     }
                                 }
-                            } => {},
-                            _ = &mut kick_rx => {
-                                let resp = AuthResponse {
-                                    status: "ERROR".to_string(),
-                                    message: "LIMIT_EXCEEDED".to_string(),
-                                };
-                                let _ = sender.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
-                            }
+                            } => {}
                         }
 
-                        // Decrement connection limit/clean up on disconnect
+                        // Decrement connection list / clean up this connection on disconnect
                         let mut conns = state.active_connections.lock().await;
-                        if let Some(list) = conns.get_mut(&user_id) {
-                            list.retain(|c| c.id != conn_id);
-                            if list.is_empty() {
+                        if let Some(conns_list) = conns.get_mut(&user_id) {
+                            conns_list.retain(|c| c.id != conn_id);
+                            if conns_list.is_empty() {
                                 conns.remove(&user_id);
                             }
                         }
