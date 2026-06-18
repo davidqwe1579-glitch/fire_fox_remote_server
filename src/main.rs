@@ -114,7 +114,15 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             id: conn_id,
                             disconnect_tx,
                         });
+                        let current_count = conns_list.len() as i32;
                         drop(conns);
+
+                        // Update DB with the current active connection count
+                        let _ = sqlx::query("UPDATE user SET current_connections = ? WHERE user_id = ?")
+                            .bind(current_count)
+                            .bind(&user_id)
+                            .execute(&state.db)
+                            .await;
                         
                         let resp = AuthResponse {
                             status: "OK".to_string(),
@@ -171,12 +179,22 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
 
                         // Decrement connection list / clean up this connection on disconnect
                         let mut conns = state.active_connections.lock().await;
+                        let mut current_count = 0;
                         if let Some(conns_list) = conns.get_mut(&user_id) {
                             conns_list.retain(|c| c.id != conn_id);
+                            current_count = conns_list.len() as i32;
                             if conns_list.is_empty() {
                                 conns.remove(&user_id);
                             }
                         }
+                        drop(conns);
+
+                        // Update DB with the new count
+                        let _ = sqlx::query("UPDATE user SET current_connections = ? WHERE user_id = ?")
+                            .bind(current_count)
+                            .bind(&user_id)
+                            .execute(&state.db)
+                            .await;
                     }
                     Err(_) => {
                         let resp = AuthResponse {
