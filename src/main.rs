@@ -128,19 +128,30 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                     .fetch_one(&state_clone.db)
                                     .await;
 
-                                    if let Ok((expire_date,)) = row {
-                                        let now = chrono::Utc::now().naive_utc();
-                                        if now > expire_date {
-                                            let resp = AuthResponse {
-                                                status: "ERROR".to_string(),
-                                                message: "EXPIRED".to_string(),
-                                            };
-                                            let _ = sender.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
-                                            break;
-                                        }
-                                    } else {
-                                        break; 
-                                    }
+                                     match row {
+                                         Ok((expire_date,)) => {
+                                             let now = chrono::Utc::now().naive_utc();
+                                             if now > expire_date {
+                                                 let resp = AuthResponse {
+                                                     status: "ERROR".to_string(),
+                                                     message: "EXPIRED".to_string(),
+                                                 };
+                                                 let _ = sender.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
+                                                 break;
+                                             }
+                                         }
+                                         Err(sqlx::Error::RowNotFound) => {
+                                             let resp = AuthResponse {
+                                                 status: "ERROR".to_string(),
+                                                 message: "USER_NOT_FOUND".to_string(),
+                                             };
+                                             let _ = sender.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
+                                             break;
+                                         }
+                                         Err(e) => {
+                                             eprintln!("Database check query error: {}. Retrying in next tick...", e);
+                                         }
+                                     }
                                 }
                             } => {},
                             _ = async {
