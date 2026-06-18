@@ -13,10 +13,19 @@ use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+struct ActiveConnection {
+    id: u64,
+    kick_tx: tokio::sync::oneshot::Sender<()>,
+}
+
 #[derive(Clone)]
 struct AppState {
     db: MySqlPool,
-    active_connections: Arc<Mutex<HashMap<String, i32>>>,
+    active_connections: Arc<Mutex<HashMap<String, Vec<ActiveConnection>>>>,
 }
 
 #[derive(Deserialize)]
@@ -91,26 +100,37 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         }
 
                         let mut conns = state.active_connections.lock().await;
-                        let current_count = conns.get(&user_id).copied().unwrap_or(0);
+                        let list = conns.entry(user_id.clone()).or_default();
                         
-                        if current_count >= max_connections {
-                            let resp = AuthResponse {
-                                status: "ERROR".to_string(),
-                                message: "LIMIT_EXCEEDED".to_string(),
-                            };
-                            let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
-                            let _ = socket.close().await;
-                            return;
+                        // If limit is exceeded, kick the oldest connection(s)
+                        while list.len() >= max_connections as usize && !list.is_empty() {
+                            let oldest = list.remove(0);
+                            let _ = oldest.kick_tx.send(());
                         }
 
-                        conns.insert(user_id.clone(), current_count + 1);
+                        let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
+                        let (kick_tx, mut kick_rx) = tokio::sync::oneshot::channel();
+                        list.push(ActiveConnection {
+                            id: conn_id,
+                            kick_tx,
+                        });
                         drop(conns);
                         
                         let resp = AuthResponse {
                             status: "OK".to_string(),
                             message: "LOGGED_IN".to_string(),
                         };
-                        let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
+                        if socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await.is_err() {
+                            // Clean up connection immediately if send failed
+                            let mut conns = state.active_connections.lock().await;
+                            if let Some(list) = conns.get_mut(&user_id) {
+                                list.retain(|c| c.id != conn_id);
+                                if list.is_empty() {
+                                    conns.remove(&user_id);
+                                }
+                            }
+                            return;
+                        }
 
                         let (mut sender, mut receiver) = socket.split();
                         let user_id_clone = user_id.clone();
@@ -149,14 +169,21 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                         break;
                                     }
                                 }
-                            } => {}
+                            } => {},
+                            _ = &mut kick_rx => {
+                                let resp = AuthResponse {
+                                    status: "ERROR".to_string(),
+                                    message: "LIMIT_EXCEEDED".to_string(),
+                                };
+                                let _ = sender.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
+                            }
                         }
 
-                        // Decrement connection limit on disconnect
+                        // Decrement connection limit/clean up on disconnect
                         let mut conns = state.active_connections.lock().await;
-                        if let Some(c) = conns.get_mut(&user_id) {
-                            *c -= 1;
-                            if *c <= 0 {
+                        if let Some(list) = conns.get_mut(&user_id) {
+                            list.retain(|c| c.id != conn_id);
+                            if list.is_empty() {
                                 conns.remove(&user_id);
                             }
                         }
