@@ -98,6 +98,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             let resp = AuthResponse {
                                 status: "ERROR".to_string(),
                                 message: "EXPIRED".to_string(),
+                                expire_date: None,
                             };
                             let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
                             let _ = socket.close().await;
@@ -132,6 +133,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             let resp = AuthResponse {
                                 status: "ERROR".to_string(),
                                 message: "LIMIT_EXCEEDED".to_string(),
+                                expire_date: None,
                             };
                             let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
                             let _ = socket.close().await;
@@ -174,6 +176,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                 let resp = AuthResponse {
                                     status: "ERROR".to_string(),
                                     message: "EVICTED".to_string(),
+                                    expire_date: None,
                                 };
                                 let _ = sender.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
                             }
@@ -194,6 +197,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                                 let resp = AuthResponse {
                                                     status: "ERROR".to_string(),
                                                     message: "EXPIRED".to_string(),
+                                                    expire_date: None,
                                                 };
                                                 let _ = sender.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
                                                 break;
@@ -238,6 +242,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         let resp = AuthResponse {
                             status: "ERROR".to_string(),
                             message: "INVALID_USER".to_string(),
+                            expire_date: None,
                         };
                         let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
                         let _ = socket.close().await;
