@@ -165,12 +165,16 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         }
 
                         // Block duplicate manager logins (only one manager session per account)
-                        if client_is_manager && manager_logged_in != 0 {
+                        // If we have already evicted a duplicate session/UUID, we consider this a reconnection
+                        // and allow the new manager connection. Otherwise reject if a manager is already logged in.
+                        let reject_manager = client_is_manager && manager_logged_in != 0 && !evicted;
+                        if reject_manager {
                             eprintln!("[CONN] Rejected! Manager already logged in for user: {}", user_id);
                             drop(conns);
                             let resp = AuthResponse {
                                 status: "ERROR".to_string(),
                                 message: "MANAGER_ALREADY_LOGGED_IN".to_string(),
+                                is_manager: false,
                             };
                             let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
                             let _ = socket.close().await;
