@@ -197,19 +197,22 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             }
                         }
 
-                        // If limit is exceeded, reject
-                        if conns_list.len() >= max_connections as usize {
-                            eprintln!("[CONN] Rejected! Limit {} reached.", max_connections);
-                            drop(conns);
-                            let resp = AuthResponse {
-                                status: "ERROR".to_string(),
-                                message: "세션 초과".to_string(),
-                                is_manager: false,
-                                expire_date: String::new(),
-                            };
-                            let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
-                            let _ = socket.close().await;
-                            return;
+                        // If limit is exceeded, reject (managers don't count toward limit)
+                        if !client_is_manager {
+                            let non_manager_count = conns_list.iter().filter(|c| !c.is_manager).count();
+                            if non_manager_count >= max_connections as usize {
+                                eprintln!("[CONN] Rejected! Limit {} reached (non-manager count: {}).", max_connections, non_manager_count);
+                                drop(conns);
+                                let resp = AuthResponse {
+                                    status: "ERROR".to_string(),
+                                    message: "세션 초과".to_string(),
+                                    is_manager: false,
+                                    expire_date: String::new(),
+                                };
+                                let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
+                                let _ = socket.close().await;
+                                return;
+                            }
                         }
 
                         eprintln!("[CONN] Accepted!");
