@@ -49,6 +49,7 @@ struct AuthResponse {
     status: String,
     message: String,
     is_manager: bool,
+    expire_date: String,
 }
 
 #[tokio::main]
@@ -112,6 +113,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                 status: "ERROR".to_string(),
                                 message: "EXPIRED".to_string(),
                                 is_manager: false,
+                                expire_date: String::new(),
                             };
                             let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
                             let _ = socket.close().await;
@@ -181,6 +183,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                     status: "ERROR".to_string(),
                                     message: "MANAGER_ALREADY_LOGGED_IN".to_string(),
                                     is_manager: false,
+                                    expire_date: String::new(),
                                 };
                                 let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
                                 let _ = socket.close().await;
@@ -202,6 +205,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                 status: "ERROR".to_string(),
                                 message: "세션 초과".to_string(),
                                 is_manager: false,
+                                expire_date: String::new(),
                             };
                             let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
                             let _ = socket.close().await;
@@ -284,6 +288,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             status: "OK".to_string(),
                             message: "LOGGED_IN".to_string(),
                             is_manager: client_is_manager,
+                            expire_date: expire_date.format("%Y-%m-%d").to_string(),
                         };
                         let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
 
@@ -314,6 +319,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                         status: "ERROR".to_string(),
                                         message: "EVICTED".to_string(),
                                         is_manager: false,
+                                        expire_date: String::new(),
                                     };
                                     let _ = tx_out_clone2.send(Message::Text(serde_json::to_string(&resp).unwrap().into()));
                                 }
@@ -336,6 +342,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                                     status: "ERROR".to_string(),
                                                     message: "EXPIRED".to_string(),
                                                     is_manager: false,
+                                                    expire_date: String::new(),
                                                 };
                                                 let _ = tx_out_clone3.send(Message::Text(serde_json::to_string(&resp).unwrap().into()));
                                                 break;
@@ -411,6 +418,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             status: "ERROR".to_string(),
                             message: "INVALID_USER".to_string(),
                             is_manager: false,
+                            expire_date: String::new(),
                         };
                         let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
                         let _ = socket.close().await;
