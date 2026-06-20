@@ -48,6 +48,10 @@ struct AuthRequest {
 struct AuthResponse {
     status: String,
     message: String,
+    is_manager: bool,
+
+    status: String,
+    message: String,
 }
 
 #[tokio::main]
@@ -209,7 +213,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         });
 
                         let current_count = conns_list.len() as i32;
-                        let db_count = current_count - 1;
+                        let db_count = current_count; // store actual active connection count
 
                         // Broadcast updated peers list to all clients of this user
                         let peers_payload = serde_json::json!({
@@ -259,6 +263,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         let resp = AuthResponse {
                             status: "OK".to_string(),
                             message: "LOGGED_IN".to_string(),
+                            is_manager: client_is_manager,
                         };
                         let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
 
@@ -360,7 +365,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                 conns.remove(&user_id);
                             }
                         }
-                        let db_count = current_count - 1;
+                        let db_count = current_count; // store actual remaining connections
                         drop(conns);
 
                         // Update DB on disconnect
