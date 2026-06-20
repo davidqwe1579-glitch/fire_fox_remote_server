@@ -200,7 +200,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             drop(conns);
                             let resp = AuthResponse {
                                 status: "ERROR".to_string(),
-                                message: "LIMIT_EXCEEDED".to_string(),
+                                message: "세션 초과".to_string(),
                                 is_manager: false,
                             };
                             let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
