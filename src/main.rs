@@ -17,7 +17,11 @@ struct ConnectionInfo {
     id: u64,
     uuid: String,
     session_id: String,
+    username: String,
+    hostname: String,
+    platform: String,
     is_manager: bool,
+    broadcast_tx: tokio::sync::mpsc::UnboundedSender<Message>,
     disconnect_tx: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -34,6 +38,9 @@ struct AuthRequest {
     user_id: String,
     uuid: Option<String>,
     session_id: Option<String>,
+    username: Option<String>,
+    hostname: Option<String>,
+    platform: Option<String>,
     is_manager: Option<bool>,
 }
 
@@ -41,8 +48,6 @@ struct AuthRequest {
 struct AuthResponse {
     status: String,
     message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    expire_date: Option<String>,
 }
 
 #[tokio::main]
@@ -60,8 +65,8 @@ async fn main() {
         }
     };
 
-    // Reset current_connections to -1 and manager_logged_in to 0 on startup
-    let _ = sqlx::query("UPDATE user SET current_connections = -1, manager_logged_in = 0")
+    // Initialize connection counters on startup
+    let _ = sqlx::query("UPDATE user SET current_connections = 0, manager_logged_in = 0")
         .execute(&pool)
         .await;
 
@@ -89,7 +94,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         if let Ok(Message::Text(text)) = msg {
             if let Ok(req) = serde_json::from_str::<AuthRequest>(&text) {
                 let user_id = req.user_id.clone();
-                
+
                 // Use UTC comparison. MySQL DATETIME is retrieved as NaiveDateTime
                 let row: Result<(chrono::NaiveDateTime, i32, i8), sqlx::Error> = sqlx::query_as(
                     "SELECT expire_date, connections, manager_logged_in FROM user WHERE user_id = ?"
@@ -105,7 +110,6 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             let resp = AuthResponse {
                                 status: "ERROR".to_string(),
                                 message: "EXPIRED".to_string(),
-                                expire_date: None,
                             };
                             let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
                             let _ = socket.close().await;
@@ -115,15 +119,23 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         let client_uuid = req.uuid.clone().unwrap_or_default();
                         let client_session_id = req.session_id.clone().unwrap_or_default();
                         let client_is_manager = req.is_manager.unwrap_or(false);
-                        
+
+                        eprintln!("[CONN] Request - User: {}, UUID: '{}', Session: '{}', is_manager: {}", user_id, client_uuid, client_session_id, client_is_manager);
+
                         let mut conns = state.active_connections.lock().await;
                         let conns_list = conns.entry(user_id.clone()).or_insert_with(Vec::new);
-                        
+
+                        eprintln!("[CONN] Before check - Active count: {}. Connections: {:?}",
+                            conns_list.len(),
+                            conns_list.iter().map(|c| format!("(session_id: '{}', uuid: '{}')", c.session_id, c.uuid)).collect::<Vec<_>>()
+                        );
+
                         // Always evict duplicate session_id first (reconnections of the same running process)
                         let mut evicted = false;
                         if !client_session_id.is_empty() {
                             if let Some(pos) = conns_list.iter().position(|c| c.session_id == client_session_id) {
                                 let old_conn = conns_list.remove(pos);
+                                eprintln!("[CONN] Evicting duplicate session_id: '{}'", client_session_id);
                                 let _ = old_conn.disconnect_tx.send(());
                                 evicted = true;
                             }
@@ -132,64 +144,110 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         if !evicted && client_session_id.is_empty() && !client_uuid.is_empty() {
                             if let Some(pos) = conns_list.iter().position(|c| c.uuid == client_uuid) {
                                 let old_conn = conns_list.remove(pos);
+                                eprintln!("[CONN] Evicting duplicate UUID (fallback): '{}'", client_uuid);
+                                let _ = old_conn.disconnect_tx.send(());
+                                evicted = true;
+                            }
+                        }
+
+                        // If limit is exceeded, and we have an active connection with the same uuid (but different session_id),
+                        // evict it to let the new session connect.
+                        if !evicted && conns_list.len() > max_connections as usize && !client_uuid.is_empty() {
+                            if let Some(pos) = conns_list.iter().position(|c| c.uuid == client_uuid) {
+                                let old_conn = conns_list.remove(pos);
+                                eprintln!("[CONN] Evicting duplicate UUID under limit constraint: '{}'", client_uuid);
                                 let _ = old_conn.disconnect_tx.send(());
                             }
                         }
 
-                        // Check if trying to log in as manager
-                        if client_is_manager {
-                            let mut has_manager = conns_list.iter().any(|c| c.is_manager);
-                            if !has_manager && manager_logged_in != 0 {
-                                // If DB says manager logged in, but no active manager in memory, trust memory and heal DB
-                                has_manager = false;
-                            }
-
-                            if has_manager {
-                                drop(conns);
-                                let resp = AuthResponse {
-                                    status: "ERROR".to_string(),
-                                    message: "MANAGER_ALREADY_LOGGED_IN".to_string(),
-                                    expire_date: None,
-                                };
-                                let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
-                                let _ = socket.close().await;
-                                return;
-                            }
-                        }
-
-                        // If limit is exceeded, reject this new connection with LIMIT_EXCEEDED.
-                        if conns_list.len() >= max_connections as usize {
+                        // Block duplicate manager logins (only one manager session per account)
+                        if client_is_manager && manager_logged_in != 0 {
+                            eprintln!("[CONN] Rejected! Manager already logged in for user: {}", user_id);
                             drop(conns);
                             let resp = AuthResponse {
                                 status: "ERROR".to_string(),
-                                message: "LIMIT_EXCEEDED".to_string(),
-                                expire_date: None,
+                                message: "MANAGER_ALREADY_LOGGED_IN".to_string(),
                             };
                             let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
                             let _ = socket.close().await;
                             return;
                         }
 
-                        // Create disconnect channel for this connection
-                        let (disconnect_tx, mut disconnect_rx) = tokio::sync::oneshot::channel::<()>();
+                        // If limit is exceeded, reject this new connection with LIMIT_EXCEEDED.
+                        if conns_list.len() > max_connections as usize {
+                            eprintln!("[CONN] Rejected! Limit {} exceeded. Active count: {}", max_connections, conns_list.len());
+                            drop(conns);
+                            let resp = AuthResponse {
+                                status: "ERROR".to_string(),
+                                message: "LIMIT_EXCEEDED".to_string(),
+                            };
+                            let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
+                            let _ = socket.close().await;
+                            return;
+                        }
+
+                        eprintln!("[CONN] Accepted!");
+
+                        // Create channels for this connection
+                        let (disconnect_tx, disconnect_rx) = tokio::sync::oneshot::channel::<()>();
+                        let (broadcast_tx, mut broadcast_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+
+                        let client_username = req.username.clone().unwrap_or_default();
+                        let client_hostname = req.hostname.clone().unwrap_or_default();
+                        let client_platform = req.platform.clone().unwrap_or_default();
+
                         conns_list.push(ConnectionInfo {
                             id: conn_id,
                             uuid: client_uuid,
                             session_id: client_session_id,
+                            username: client_username,
+                            hostname: client_hostname,
+                            platform: client_platform,
                             is_manager: client_is_manager,
+                            broadcast_tx,
                             disconnect_tx,
                         });
+
                         let current_count = conns_list.len() as i32;
                         let db_count = current_count - 1;
+
+                        // Broadcast updated peers list to all clients of this user
+                        let peers_payload = serde_json::json!({
+                            "status": "PEERS_UPDATE",
+                            "peers": conns_list.iter().map(|c| serde_json::json!({
+                                "id": c.uuid.clone(),
+                                "username": c.username.clone(),
+                                "hostname": c.hostname.clone(),
+                                "platform": c.platform.clone(),
+                            })).collect::<Vec<_>>()
+                        }).to_string();
+                        for c in conns_list.iter() {
+                            let _ = c.broadcast_tx.send(Message::Text(peers_payload.clone().into()));
+                        }
+
                         drop(conns);
 
-                        // Update DB with the current active connection count and manager status
+                        // Update DB: set manager flag or connection count
                         if client_is_manager {
-                            let _ = sqlx::query("UPDATE user SET current_connections = ?, manager_logged_in = 1 WHERE user_id = ?")
-                                .bind(db_count)
+                            let result = sqlx::query("UPDATE user SET manager_logged_in = 1 WHERE user_id = ?")
                                 .bind(&user_id)
                                 .execute(&state.db)
                                 .await;
+                            match result {
+                                Ok(_) => {
+                                    let flag: i32 = sqlx::query_scalar(
+                                        "SELECT manager_logged_in FROM user WHERE user_id = ?"
+                                    )
+                                    .bind(&user_id)
+                                    .fetch_one(&state.db)
+                                    .await
+                                    .unwrap_or(0);
+                                    eprintln!("[DEBUG] manager_logged_in set to {} for user {}", flag, user_id);
+                                }
+                                Err(e) => {
+                                    eprintln!("[ERROR] Failed to set manager_logged_in: {}", e);
+                                }
+                            }
                         } else {
                             let _ = sqlx::query("UPDATE user SET current_connections = ? WHERE user_id = ?")
                                 .bind(db_count)
@@ -197,28 +255,43 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                 .execute(&state.db)
                                 .await;
                         }
-                        
+
                         let resp = AuthResponse {
                             status: "OK".to_string(),
                             message: "LOGGED_IN".to_string(),
-                            expire_date: Some(expire_date.format("%Y-%m-%d %H:%M:%S").to_string()),
                         };
                         let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
 
                         let (mut sender, mut receiver) = socket.split();
+                        let (tx_out, mut rx_out) = tokio::sync::mpsc::unbounded_channel::<Message>();
+                        let tx_out_clone1 = tx_out.clone();
+                        let tx_out_clone2 = tx_out.clone();
+                        let tx_out_clone3 = tx_out.clone();
+
                         let user_id_clone = user_id.clone();
                         let state_clone = state.clone();
                         let mut check_interval = tokio::time::interval(Duration::from_secs(10));
-                        
+
                         tokio::select! {
-                            _ = &mut disconnect_rx => {
-                                let resp = AuthResponse {
-                                    status: "ERROR".to_string(),
-                                    message: "EVICTED".to_string(),
-                                    expire_date: None,
-                                };
-                                let _ = sender.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
-                            }
+                            _ = async {
+                                while let Some(msg) = rx_out.recv().await {
+                                    let _ = sender.send(msg).await;
+                                }
+                            } => {}
+                            _ = async {
+                                while let Some(msg) = broadcast_rx.recv().await {
+                                    let _ = tx_out_clone1.send(msg);
+                                }
+                            } => {}
+                            _ = async {
+                                if let Ok(_) = disconnect_rx.await {
+                                    let resp = AuthResponse {
+                                        status: "ERROR".to_string(),
+                                        message: "EVICTED".to_string(),
+                                    };
+                                    let _ = tx_out_clone2.send(Message::Text(serde_json::to_string(&resp).unwrap().into()));
+                                }
+                            } => {}
                             _ = async {
                                 loop {
                                     check_interval.tick().await;
@@ -236,9 +309,8 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                                 let resp = AuthResponse {
                                                     status: "ERROR".to_string(),
                                                     message: "EXPIRED".to_string(),
-                                                    expire_date: None,
                                                 };
-                                                let _ = sender.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
+                                                let _ = tx_out_clone3.send(Message::Text(serde_json::to_string(&resp).unwrap().into()));
                                                 break;
                                             }
                                         }
@@ -259,14 +331,31 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
 
                         // Decrement connection list / clean up this connection on disconnect
                         let mut conns = state.active_connections.lock().await;
-                        let mut current_count = 0;
                         let mut was_manager = false;
+                        let mut current_count = 0;
                         if let Some(conns_list) = conns.get_mut(&user_id) {
                             if let Some(pos) = conns_list.iter().position(|c| c.id == conn_id) {
                                 let conn_info = conns_list.remove(pos);
                                 was_manager = conn_info.is_manager;
                             }
                             current_count = conns_list.len() as i32;
+
+                            // Broadcast updated peers list to remaining clients
+                            if !conns_list.is_empty() {
+                                let peers_payload = serde_json::json!({
+                                    "status": "PEERS_UPDATE",
+                                    "peers": conns_list.iter().map(|c| serde_json::json!({
+                                        "id": c.uuid.clone(),
+                                        "username": c.username.clone(),
+                                        "hostname": c.hostname.clone(),
+                                        "platform": c.platform.clone(),
+                                    })).collect::<Vec<_>>()
+                                }).to_string();
+                                for c in conns_list.iter() {
+                                    let _ = c.broadcast_tx.send(Message::Text(peers_payload.clone().into()));
+                                }
+                            }
+
                             if conns_list.is_empty() {
                                 conns.remove(&user_id);
                             }
@@ -274,13 +363,13 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         let db_count = current_count - 1;
                         drop(conns);
 
-                        // Update DB with the new count and manager status
+                        // Update DB on disconnect
                         if was_manager {
-                            let _ = sqlx::query("UPDATE user SET current_connections = ?, manager_logged_in = 0 WHERE user_id = ?")
-                                .bind(db_count)
+                            let _ = sqlx::query("UPDATE user SET manager_logged_in = 0 WHERE user_id = ?")
                                 .bind(&user_id)
                                 .execute(&state.db)
                                 .await;
+                            eprintln!("[DEBUG] manager_logged_in reset to 0 for user {}", user_id);
                         } else {
                             let _ = sqlx::query("UPDATE user SET current_connections = ? WHERE user_id = ?")
                                 .bind(db_count)
@@ -293,7 +382,6 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         let resp = AuthResponse {
                             status: "ERROR".to_string(),
                             message: "INVALID_USER".to_string(),
-                            expire_date: None,
                         };
                         let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
                         let _ = socket.close().await;
