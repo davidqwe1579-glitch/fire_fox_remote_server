@@ -17,6 +17,7 @@ struct ConnectionInfo {
     id: u64,
     uuid: String,
     session_id: String,
+    is_manager: bool,
     disconnect_tx: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -33,6 +34,7 @@ struct AuthRequest {
     user_id: String,
     uuid: Option<String>,
     session_id: Option<String>,
+    is_manager: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -57,6 +59,11 @@ async fn main() {
             return;
         }
     };
+
+    // Reset current_connections to -1 and manager_logged_in to 0 on startup
+    let _ = sqlx::query("UPDATE user SET current_connections = -1, manager_logged_in = 0")
+        .execute(&pool)
+        .await;
 
     let state = AppState {
         db: pool,
@@ -84,15 +91,15 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                 let user_id = req.user_id.clone();
                 
                 // Use UTC comparison. MySQL DATETIME is retrieved as NaiveDateTime
-                let row: Result<(chrono::NaiveDateTime, i32), sqlx::Error> = sqlx::query_as(
-                    "SELECT expire_date, connections FROM user WHERE user_id = ?"
+                let row: Result<(chrono::NaiveDateTime, i32, i8), sqlx::Error> = sqlx::query_as(
+                    "SELECT expire_date, connections, manager_logged_in FROM user WHERE user_id = ?"
                 )
                 .bind(&user_id)
                 .fetch_one(&state.db)
                 .await;
 
                 match row {
-                    Ok((expire_date, max_connections)) => {
+                    Ok((expire_date, max_connections, manager_logged_in)) => {
                         let now = chrono::Utc::now().naive_utc();
                         if now > expire_date {
                             let resp = AuthResponse {
@@ -107,6 +114,8 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
 
                         let client_uuid = req.uuid.clone().unwrap_or_default();
                         let client_session_id = req.session_id.clone().unwrap_or_default();
+                        let client_is_manager = req.is_manager.unwrap_or(false);
+                        
                         let mut conns = state.active_connections.lock().await;
                         let conns_list = conns.entry(user_id.clone()).or_insert_with(Vec::new);
                         
@@ -124,6 +133,27 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             if let Some(pos) = conns_list.iter().position(|c| c.uuid == client_uuid) {
                                 let old_conn = conns_list.remove(pos);
                                 let _ = old_conn.disconnect_tx.send(());
+                            }
+                        }
+
+                        // Check if trying to log in as manager
+                        if client_is_manager {
+                            let mut has_manager = conns_list.iter().any(|c| c.is_manager);
+                            if !has_manager && manager_logged_in != 0 {
+                                // If DB says manager logged in, but no active manager in memory, trust memory and heal DB
+                                has_manager = false;
+                            }
+
+                            if has_manager {
+                                drop(conns);
+                                let resp = AuthResponse {
+                                    status: "ERROR".to_string(),
+                                    message: "MANAGER_ALREADY_LOGGED_IN".to_string(),
+                                    expire_date: None,
+                                };
+                                let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
+                                let _ = socket.close().await;
+                                return;
                             }
                         }
 
@@ -146,18 +176,27 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             id: conn_id,
                             uuid: client_uuid,
                             session_id: client_session_id,
+                            is_manager: client_is_manager,
                             disconnect_tx,
                         });
                         let current_count = conns_list.len() as i32;
                         let db_count = current_count - 1;
                         drop(conns);
 
-                        // Update DB with the current active connection count
-                        let _ = sqlx::query("UPDATE user SET current_connections = ? WHERE user_id = ?")
-                            .bind(db_count)
-                            .bind(&user_id)
-                            .execute(&state.db)
-                            .await;
+                        // Update DB with the current active connection count and manager status
+                        if client_is_manager {
+                            let _ = sqlx::query("UPDATE user SET current_connections = ?, manager_logged_in = 1 WHERE user_id = ?")
+                                .bind(db_count)
+                                .bind(&user_id)
+                                .execute(&state.db)
+                                .await;
+                        } else {
+                            let _ = sqlx::query("UPDATE user SET current_connections = ? WHERE user_id = ?")
+                                .bind(db_count)
+                                .bind(&user_id)
+                                .execute(&state.db)
+                                .await;
+                        }
                         
                         let resp = AuthResponse {
                             status: "OK".to_string(),
@@ -221,8 +260,12 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         // Decrement connection list / clean up this connection on disconnect
                         let mut conns = state.active_connections.lock().await;
                         let mut current_count = 0;
+                        let mut was_manager = false;
                         if let Some(conns_list) = conns.get_mut(&user_id) {
-                            conns_list.retain(|c| c.id != conn_id);
+                            if let Some(pos) = conns_list.iter().position(|c| c.id == conn_id) {
+                                let conn_info = conns_list.remove(pos);
+                                was_manager = conn_info.is_manager;
+                            }
                             current_count = conns_list.len() as i32;
                             if conns_list.is_empty() {
                                 conns.remove(&user_id);
@@ -231,12 +274,20 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         let db_count = current_count - 1;
                         drop(conns);
 
-                        // Update DB with the new count
-                        let _ = sqlx::query("UPDATE user SET current_connections = ? WHERE user_id = ?")
-                            .bind(db_count)
-                            .bind(&user_id)
-                            .execute(&state.db)
-                            .await;
+                        // Update DB with the new count and manager status
+                        if was_manager {
+                            let _ = sqlx::query("UPDATE user SET current_connections = ?, manager_logged_in = 0 WHERE user_id = ?")
+                                .bind(db_count)
+                                .bind(&user_id)
+                                .execute(&state.db)
+                                .await;
+                        } else {
+                            let _ = sqlx::query("UPDATE user SET current_connections = ? WHERE user_id = ?")
+                                .bind(db_count)
+                                .bind(&user_id)
+                                .execute(&state.db)
+                                .await;
+                        }
                     }
                     Err(_) => {
                         let resp = AuthResponse {
