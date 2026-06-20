@@ -49,9 +49,6 @@ struct AuthResponse {
     status: String,
     message: String,
     is_manager: bool,
-
-    status: String,
-    message: String,
 }
 
 #[tokio::main]
@@ -108,12 +105,13 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                 .await;
 
                 match row {
-                    Ok((expire_date, max_connections, manager_logged_in)) => {
+                    Ok((expire_date, max_connections, mut manager_logged_in)) => {
                         let now = chrono::Utc::now().naive_utc();
                         if now > expire_date {
                             let resp = AuthResponse {
                                 status: "ERROR".to_string(),
                                 message: "EXPIRED".to_string(),
+                                is_manager: false,
                             };
                             let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
                             let _ = socket.close().await;
@@ -134,60 +132,76 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             conns_list.iter().map(|c| format!("(session_id: '{}', uuid: '{}')", c.session_id, c.uuid)).collect::<Vec<_>>()
                         );
 
-                        // Always evict duplicate session_id first (reconnections of the same running process)
+                        // Always evict duplicate session_id first
                         let mut evicted = false;
                         if !client_session_id.is_empty() {
                             if let Some(pos) = conns_list.iter().position(|c| c.session_id == client_session_id) {
                                 let old_conn = conns_list.remove(pos);
                                 eprintln!("[CONN] Evicting duplicate session_id: '{}'", client_session_id);
+                                if old_conn.is_manager {
+                                    let _ = sqlx::query("UPDATE user SET manager_logged_in = 0 WHERE user_id = ?")
+                                        .bind(&user_id)
+                                        .execute(&state.db)
+                                        .await;
+                                    manager_logged_in = 0;
+                                }
+                                let _ = old_conn.disconnect_tx.send(());                                evicted = true;
+                            }
+                        }
+                        // Fallback to uuid eviction
+                        if !evicted && !client_uuid.is_empty() {
+                            if let Some(pos) = conns_list.iter().position(|c| c.uuid == client_uuid) {
+                                let old_conn = conns_list.remove(pos);
+                                eprintln!("[CONN] Evicting duplicate UUID: '{}'", client_uuid);
+                                if old_conn.is_manager {
+                                    let _ = sqlx::query("UPDATE user SET manager_logged_in = 0 WHERE user_id = ?")
+                                        .bind(&user_id)
+                                        .execute(&state.db)
+                                        .await;
+                                    manager_logged_in = 0;
+                                }
                                 let _ = old_conn.disconnect_tx.send(());
                                 evicted = true;
                             }
                         }
-                        // Fallback to uuid eviction if session_id was not provided
-                        if !evicted && client_session_id.is_empty() && !client_uuid.is_empty() {
-                            if let Some(pos) = conns_list.iter().position(|c| c.uuid == client_uuid) {
-                                let old_conn = conns_list.remove(pos);
-                                eprintln!("[CONN] Evicting duplicate UUID (fallback): '{}'", client_uuid);
-                                let _ = old_conn.disconnect_tx.send(());
-                                evicted = true;
+
+                        // Block duplicate manager logins
+                        if client_is_manager {
+                            let mgr_flag: i32 = sqlx::query_scalar("SELECT manager_logged_in FROM user WHERE user_id = ?")
+                                .bind(&user_id)
+                                .fetch_one(&state.db)
+                                .await
+                                .unwrap_or(0);
+                            let manager_present = conns_list.iter().any(|c| c.is_manager);
+                            eprintln!("[DEBUG] Manager check - mgr_flag: {}, manager_present: {}, evicted: {}", mgr_flag, manager_present, evicted);
+                            if mgr_flag != 0 && manager_present && !evicted {
+                                eprintln!("[CONN] Rejected! Manager already logged in for user: {}", user_id);
+                                drop(conns);
+                                let resp = AuthResponse {
+                                    status: "ERROR".to_string(),
+                                    message: "MANAGER_ALREADY_LOGGED_IN".to_string(),
+                                    is_manager: false,
+                                };
+                                let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
+                                let _ = socket.close().await;
+                                return;
+                            } else if mgr_flag != 0 && !manager_present {
+                                eprintln!("[WARN] Stale manager_logged_in flag for user {} - clearing it.", user_id);
+                                let _ = sqlx::query("UPDATE user SET manager_logged_in = 0 WHERE user_id = ?")
+                                    .bind(&user_id)
+                                    .execute(&state.db)
+                                    .await;
                             }
                         }
 
-                        // If limit is exceeded, and we have an active connection with the same uuid (but different session_id),
-                        // evict it to let the new session connect.
-                        if !evicted && conns_list.len() > max_connections as usize && !client_uuid.is_empty() {
-                            if let Some(pos) = conns_list.iter().position(|c| c.uuid == client_uuid) {
-                                let old_conn = conns_list.remove(pos);
-                                eprintln!("[CONN] Evicting duplicate UUID under limit constraint: '{}'", client_uuid);
-                                let _ = old_conn.disconnect_tx.send(());
-                            }
-                        }
-
-                        // Block duplicate manager logins (only one manager session per account)
-                        // If we have already evicted a duplicate session/UUID, we consider this a reconnection
-                        // and allow the new manager connection. Otherwise reject if a manager is already logged in.
-                        let reject_manager = client_is_manager && manager_logged_in != 0 && !evicted;
-                        if reject_manager {
-                            eprintln!("[CONN] Rejected! Manager already logged in for user: {}", user_id);
-                            drop(conns);
-                            let resp = AuthResponse {
-                                status: "ERROR".to_string(),
-                                message: "MANAGER_ALREADY_LOGGED_IN".to_string(),
-                                is_manager: false,
-                            };
-                            let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
-                            let _ = socket.close().await;
-                            return;
-                        }
-
-                        // If limit is exceeded, reject this new connection with LIMIT_EXCEEDED.
-                        if conns_list.len() > max_connections as usize {
-                            eprintln!("[CONN] Rejected! Limit {} exceeded. Active count: {}", max_connections, conns_list.len());
+                        // If limit is exceeded, reject
+                        if conns_list.len() >= max_connections as usize {
+                            eprintln!("[CONN] Rejected! Limit {} reached.", max_connections);
                             drop(conns);
                             let resp = AuthResponse {
                                 status: "ERROR".to_string(),
                                 message: "LIMIT_EXCEEDED".to_string(),
+                                is_manager: false,
                             };
                             let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
                             let _ = socket.close().await;
@@ -216,8 +230,9 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                             disconnect_tx,
                         });
 
-                        let current_count = conns_list.len() as i32;
-                        let db_count = current_count; // store actual active connection count
+                        // Count only non‑manager connections for the DB counter
+                        let current_count = conns_list.iter().filter(|c| !c.is_manager).count() as i32;
+                        let db_count = current_count; // store actual active non‑manager connection count
 
                         // Broadcast updated peers list to all clients of this user
                         let peers_payload = serde_json::json!({
@@ -262,6 +277,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                 .bind(&user_id)
                                 .execute(&state.db)
                                 .await;
+                            eprintln!("[DEBUG] current_connections set to {} for user {}", db_count, user_id);
                         }
 
                         let resp = AuthResponse {
@@ -297,6 +313,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                     let resp = AuthResponse {
                                         status: "ERROR".to_string(),
                                         message: "EVICTED".to_string(),
+                                        is_manager: false,
                                     };
                                     let _ = tx_out_clone2.send(Message::Text(serde_json::to_string(&resp).unwrap().into()));
                                 }
@@ -318,6 +335,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                                 let resp = AuthResponse {
                                                     status: "ERROR".to_string(),
                                                     message: "EXPIRED".to_string(),
+                                                    is_manager: false,
                                                 };
                                                 let _ = tx_out_clone3.send(Message::Text(serde_json::to_string(&resp).unwrap().into()));
                                                 break;
@@ -341,13 +359,14 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                         // Decrement connection list / clean up this connection on disconnect
                         let mut conns = state.active_connections.lock().await;
                         let mut was_manager = false;
-                        let mut current_count = 0;
+                        let mut db_count: i32 = 0;
                         if let Some(conns_list) = conns.get_mut(&user_id) {
                             if let Some(pos) = conns_list.iter().position(|c| c.id == conn_id) {
                                 let conn_info = conns_list.remove(pos);
                                 was_manager = conn_info.is_manager;
                             }
-                            current_count = conns_list.len() as i32;
+                            // Count only non-manager connections remaining
+                            db_count = conns_list.iter().filter(|c| !c.is_manager).count() as i32;
 
                             // Broadcast updated peers list to remaining clients
                             if !conns_list.is_empty() {
@@ -369,7 +388,6 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                 conns.remove(&user_id);
                             }
                         }
-                        let db_count = current_count; // store actual remaining connections
                         drop(conns);
 
                         // Update DB on disconnect
@@ -385,12 +403,14 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                 .bind(&user_id)
                                 .execute(&state.db)
                                 .await;
+                            eprintln!("[DEBUG] current_connections on disconnect set to {} for user {}", db_count, user_id);
                         }
                     }
                     Err(_) => {
                         let resp = AuthResponse {
                             status: "ERROR".to_string(),
                             message: "INVALID_USER".to_string(),
+                            is_manager: false,
                         };
                         let _ = socket.send(Message::Text(serde_json::to_string(&resp).unwrap().into())).await;
                         let _ = socket.close().await;
