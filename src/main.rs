@@ -105,7 +105,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                 .await;
 
                 match row {
-                    Ok((expire_date, max_connections, mut manager_logged_in)) => {
+                    Ok((expire_date, max_connections, _manager_logged_in)) => {
                         let now = chrono::Utc::now().naive_utc();
                         if now > expire_date {
                             let resp = AuthResponse {
@@ -143,7 +143,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                         .bind(&user_id)
                                         .execute(&state.db)
                                         .await;
-                                    manager_logged_in = 0;
+                                    // DB already updated above
                                 }
                                 let _ = old_conn.disconnect_tx.send(());                                evicted = true;
                             }
@@ -158,7 +158,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                                         .bind(&user_id)
                                         .execute(&state.db)
                                         .await;
-                                    manager_logged_in = 0;
+                                    // DB already updated above
                                 }
                                 let _ = old_conn.disconnect_tx.send(());
                                 evicted = true;
